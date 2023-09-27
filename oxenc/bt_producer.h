@@ -16,6 +16,7 @@ namespace oxenc {
 
 using namespace std::literals;
 
+template <typename Char = char, typename = std::enable_if_t<sizeof(Char) == 1>>
 class bt_dict_producer;
 
 #if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && \
@@ -55,22 +56,34 @@ char* apple_to_chars10(char* buf, IntType val) {
 /// allocating memory.  This is essentially the reverse of bt_list_consumer: where it lets you
 /// stream-parse a buffer, this class lets you build directly into a buffer.
 ///
+/// The optional `Char` templated type is primarily useful in string-builder mode (rather than fixed
+/// buffer mode) when you need to build and extract a non-char string value (e.g. a string of
+/// `unsigned char` or `std::byte`).
+///
 /// Out-of-buffer-space errors throw std::length_error when using an external buffer.
+template <typename Char = char, typename = std::enable_if_t<sizeof(Char) == 1>>
 class bt_list_producer {
-    friend class bt_dict_producer;
+    public:
+    using string_t = std::basic_string<Char>;
+    using string_view_t = std::basic_string_view<Char>;
+
+    private:
+
+    using dict_producer = bt_dict_producer<Char>;
+    friend class bt_dict_producer<Char>;
 
     // For external buffer mode we keep pointers to the start position and past-the-end positions.
     struct buf_span {
-        char* const init;
-        char* const end;
+        Char* const init;
+        Char* const end;
     };
 
     // Our output type: either external buffer pointers, or a string that we build:
-    using output = std::variant<std::string, buf_span>;
+    using output = std::variant<string_t, buf_span>;
 
     // Our data for the root list is either a begin/end pointer pair or a string; for
     // sublists it is a pointer to the parent list/dict.
-    std::variant<output, bt_list_producer*, bt_dict_producer*> data;
+    std::variant<output, bt_list_producer*, dict_producer*> data;
 
     // Reference to the output; this is simply a reference to the value inside `data` for the
     // root element, and a pointer to the root's value for sublists/subdicts.
@@ -93,10 +106,10 @@ class bt_list_producer {
 
     // Sublist constructors
     explicit bt_list_producer(bt_list_producer* parent, char prefix = 'l');
-    explicit bt_list_producer(bt_dict_producer* parent, char prefix = 'l');
+    explicit bt_list_producer(dict_producer* parent, char prefix = 'l');
 
     // Internal common constructor for both list and dict producer for external buffer mode.
-    bt_list_producer(char* begin, char* end, char prefix);
+    bt_list_producer(Char* begin, Char* end, char prefix);
 
     // Internal common constructor for both list and dict producer for expandable std::string
     // buffer mode.
@@ -159,11 +172,11 @@ class bt_list_producer {
     /// beyond the end of the buffer an exception is raised.  Note that this will happen during
     /// construction if the given buffer is not large enough to contain the `le` encoding of an
     /// empty list.
-    bt_list_producer(char* begin, char* end) : bt_list_producer{begin, end, 'l'} {}
+    bt_list_producer(Char* begin, Char* end) : bt_list_producer{begin, end, 'l'} {}
 
     /// Constructs a list producer that writes into the range [begin, begin+size).  If a write would
     /// go beyond the end of the buffer an exception is raised.
-    bt_list_producer(char* begin, size_t len) : bt_list_producer{begin, begin + len, 'l'} {}
+    bt_list_producer(Char* begin, size_t len) : bt_list_producer{begin, begin + len, 'l'} {}
 
     /// Constructs a list producer that writes to an internal, expandable string.  `reserve` can
     /// be passed a non-zero value to reserve an initial size in the std::string.
@@ -174,9 +187,9 @@ class bt_list_producer {
     /// Returns a string_view into the currently serialized data buffer.  Note that the returned
     /// view includes the `e` list end serialization markers which will be overwritten if the list
     /// (or an active sublist/subdict) is appended to.
-    std::string_view view() const {
-        if (auto* s = std::get_if<std::string>(&out))
-            return std::string_view{*s}.substr(from, next - from + 1);
+    std::basic_string_view<Char> view() const {
+        if (auto* s = std::get_if<string_t>(&out))
+            return string_view_t{*s}.substr(from, next - from + 1);
         auto& b = var::get<buf_span>(out);
         return {b.init + from, static_cast<size_t>(next - from + 1)};
     }
@@ -187,14 +200,14 @@ class bt_list_producer {
     /// sublist/subdict, or on a external buffer producer.
     ///
     /// (If you just want a copy of the string, use `view()` instead).
-    std::string str() && {
+    string_t str() && {
         if (parent())
             throw std::logic_error{"Cannot call bt_producer .str() on a sublist/subdict"};
-        auto* s = std::get_if<std::string>(&out);
+        auto* s = std::get_if<string_t>(&out);
         if (!s)
             throw std::logic_error{"Cannot call bt_producer .str() when using an external buffer"};
 
-        std::string ret;
+        string_t ret;
         ret.swap(*s);
         // Leave behind an empty producer
         *s += ret[0];
@@ -203,13 +216,14 @@ class bt_list_producer {
         return ret;
     }
 
-    /// Returns a reference to the `std::string`, when in string-builder mode.  Unlike `str()`, this
-    /// method *can* be used on a subdict/sublist, but always returns a reference to the root
-    /// object's string (unlike `.view()` which just returns the view of the current sub-producer).
-    const std::string& str_ref() {
+    /// Returns a reference to the `std::basic_string`, when in string-builder mode.  Unlike
+    /// `str()`, this method *can* be used on a subdict/sublist, but always returns a reference to
+    /// the root object's string (unlike `.view()` which just returns the view of the current
+    /// sub-producer).
+    const string_t& str_ref() {
         if (auto* p = parent())
             return p->str_ref();
-        if (auto* s = std::get_if<std::string>(&out))
+        if (auto* s = std::get_if<string_t>(&out))
             return *s;
         throw std::logic_error{"Cannot call bt_producer .str_ref() when using an external buffer"};
     }
@@ -218,14 +232,14 @@ class bt_list_producer {
     void reserve(size_t new_cap) {
         if (auto* p = parent())
             return p->reserve(new_cap);
-        if (auto* s = std::get_if<std::string>(&out))
+        if (auto* s = std::get_if<string_t>(&out))
             s->reserve(new_cap);
     }
 
     /// Returns the end position in the buffer.  (This is primarily useful for external buffer
     /// mode, but still works in string mode).
-    const char* end() const {
-        if (auto* s = std::get_if<std::string>(&out))
+    const Char* end() const {
+        if (auto* s = std::get_if<string_t>(&out))
             return s->data() + next + 1;
         auto* bs = std::get_if<buf_span>(&out);
         assert(bs);
@@ -240,7 +254,18 @@ class bt_list_producer {
         append_intermediate_ends();
     }
 
+    template <typename = std::enable_if_t<!std::is_same_v<Char, char>>>
+    void append(string_view_t data) {
+        append(std::string_view{reinterpret_cast<const char*>(data.data()), data.size()});
+    }
+
     bt_list_producer& operator+=(std::string_view data) {
+        append(data);
+        return *this;
+    }
+
+    template <typename = std::enable_if_t<!std::is_same_v<Char, char>>>
+    bt_list_producer& operator+=(string_view_t data) {
         append(data);
         return *this;
     }
@@ -302,7 +327,7 @@ class bt_list_producer {
     ///
     /// If doing more complex lifetime management, take care not to allow the child instance to
     /// outlive the parent.
-    bt_dict_producer append_dict();
+    bt_dict_producer<Char> append_dict();
 
     /// Appends a bt_value, bt_dict, or bt_list to this bt_list.  You must include the
     /// bt_value_producer.h header (either directly or via bt.h) to use this method.
@@ -316,13 +341,15 @@ class bt_list_producer {
 ///
 /// Note that bt-encoded dicts *must* be produced in (ASCII) ascending key order, but that this is
 /// only tracked/enforced for non-release builds (i.e. without -DNDEBUG).
-class bt_dict_producer : bt_list_producer {
-    friend class bt_list_producer;
+template <typename Char, typename>
+class bt_dict_producer : bt_list_producer<Char> {
+    using list_producer = bt_list_producer<Char>;
+    friend class bt_list_producer<Char>;
 
     // Subdict constructors
 
-    bt_dict_producer(bt_list_producer* parent) : bt_list_producer{parent, 'd'} {}
-    bt_dict_producer(bt_dict_producer* parent) : bt_list_producer{parent, 'd'} {}
+    bt_dict_producer(list_producer* parent) : list_producer{parent, 'd'} {}
+    bt_dict_producer(bt_dict_producer* parent) : list_producer{parent, 'd'} {}
 
     // Checks a just-written key string to make sure it is monotonically increasing from the last
     // key.  Does nothing in a release build.  (The string is outside the defines because otherwise
@@ -342,21 +369,21 @@ class bt_dict_producer : bt_list_producer {
     /// beyond the end of the buffer an exception is raised.  Note that this will happen during
     /// construction if the given buffer is not large enough to contain the `de` encoding of an
     /// empty list.
-    bt_dict_producer(char* begin, char* end) : bt_list_producer{begin, end, 'd'} {}
+    bt_dict_producer(Char* begin, Char* end) : list_producer{begin, end, 'd'} {}
 
     /// Constructs a dict producer that writes into the range [begin, begin+size).  If a write would
     /// go beyond the end of the buffer an exception is raised.
-    bt_dict_producer(char* begin, size_t len) : bt_list_producer{begin, begin + len, 'd'} {}
+    bt_dict_producer(Char* begin, size_t len) : list_producer{begin, begin + len, 'd'} {}
 
     /// Constructs a dict producer that writes to an internal, expandable string.  `reserve` can
     /// be passed a non-zero value to reserve an initial size in the std::string.
-    explicit bt_dict_producer(size_t reserve = 0) : bt_list_producer{'d', reserve} {}
+    explicit bt_dict_producer(size_t reserve = 0) : list_producer{'d', reserve} {}
 
     /// Returns a string_view into the currently serialized data buffer.  Note that the returned
     /// view includes the `e` dict end serialization markers which will be overwritten if the dict
     /// (or an active sublist/subdict) is appended to.
-    std::string_view view() const {
-        return bt_list_producer::view();
+    std::basic_string_view<Char> view() const {
+        return list_producer::view();
     }
 
     /// Extracts the string, when not using buffer mode.  This is only usable on the root
